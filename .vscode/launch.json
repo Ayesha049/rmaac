@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Train with Scenario",
+            "type": "python",
+            "request": "launch",
+            "python": "/home/axs0940/miniconda3/envs/rmarl/bin/python",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--scenario",
+                "simple"
+            ]
+        }
+    ]
+}
