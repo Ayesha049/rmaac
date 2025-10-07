@@ -77,9 +77,56 @@ def parse_args():
     parser.add_argument("--llm-disturb-interval", type=int, default=5, help="steps between disturbances")
     parser.add_argument("--num-test-episodes", type=int, default=1000, help="number of testing episodes")
 
+        # --- LLM-guided adversary ---
+    parser.add_argument("--llm-guide", type=str, default="adversary", choices=["none", "adversary"],
+                        help="enable LLM-guided perturbations")
+    parser.add_argument("--llm-guide-type", type=str, default="stochastic",
+                        choices=["stochastic", "uniform", "constraint"],
+                        help="LLM adversarial perturbation type")
+
 
 
     return parser.parse_args()
+
+
+API_KEY = ""
+
+def gpt_call(prompt):
+    # url = "https://api.openai.com/v1/chat/completions"
+    # headers = {
+    #     "Content-Type": "application/json",
+    #     "Authorization": "Bearer {}".format(API_KEY)
+    # }
+    # data = {
+    #     "model": "gpt-3.5-turbo",  # updated supported model
+    #     "messages": [
+    #         {"role": "system", "content": "You are an adversarial perturbation generator for robust RL. Output only the revised observation as a Python list."},
+    #         {"role": "user", "content": prompt}
+    #     ],
+    #     "temperature": 0.7,
+    #     "max_tokens": 200
+    # }
+
+    # try:
+    #     response = requests.post(url, headers=headers, data=json.dumps(data))
+    #     result = response.json()
+
+    #     if "error" in result:
+    #         print("OpenAI API error:", result["error"])
+    #         return None
+
+    #     if "choices" not in result or len(result["choices"]) == 0:
+    #         print("OpenAI API returned no choices:", result)
+    #         return None
+
+    #     # gpt-3.5-turbo returns content here:
+    #     return result["choices"][0]["message"]["content"].strip()
+
+    # except Exception as e:
+    #     print("GPT call failed:", str(e))
+    #     return None
+
+    return None
 
 def mlp_model(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=None):
     # This model takes as input an observation and returns values of all actions
@@ -545,12 +592,422 @@ def train_multiple_runs(arglist, seed_list):
 
     print("Saved concatenated mean episode rewards for all runs to {}".format(csv_file))
 
+
+def testWithoutP(arglist):
+    tf.reset_default_graph()
+    with U.single_threaded_session():
+        # Create environment
+        env = make_env(arglist.scenario, arglist, arglist.benchmark)
+
+        # Create agent trainers
+        obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
+        num_adversaries = min(env.n, arglist.num_adversaries)
+        trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+
+        print('Testing using good policy {} and adv policy {}'.format(
+            arglist.good_policy, arglist.adv_policy))
+
+        # Initialize TF graph
+        U.initialize()
+
+        # Load trained model
+        #if arglist.load_dir == "":
+        arglist.load_dir = arglist.save_dir
+        print('Loading trained model from {}'.format(arglist.load_dir))
+        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+
+        # Parameters for testing
+        n_episodes = arglist.num_test_episodes
+        max_episode_len = arglist.max_episode_len
+
+        all_rewards = []
+        print('Starting testing...')
+
+        for ep in range(n_episodes):
+            obs_n = env.reset()
+            episode_reward = np.zeros(env.n)
+            for step in range(max_episode_len):
+                # get actions from trained policies
+                action_n = [agent.action(obs) for agent, obs in zip(trainers, obs_n)]
+                new_obs_n, rew_n, done_n, _ = env.step(action_n)
+
+                episode_reward += rew_n
+                obs_n = new_obs_n
+
+                if arglist.display:
+                    env.render()
+                    time.sleep(0.05)
+
+                if all(done_n):
+                    break
+
+            all_rewards.append(episode_reward)
+            # print("Episode {} reward (per agent): {}".format(ep + 1, episode_reward))
+
+        mean_rewards = np.mean(all_rewards, axis=0)
+        print("Average reward per agent over {} episodes: {}".format(n_episodes, mean_rewards))
+        print("Average total reward: {}".format(np.mean(np.sum(all_rewards, axis=1))))
+        return np.mean(np.sum(all_rewards, axis=1))
+
+
+def testRobustnessOP(arglist):
+    tf.reset_default_graph()
+    with U.single_threaded_session():
+        # Create environment
+        env = make_env(arglist.scenario, arglist, arglist.benchmark)
+
+        # Create agent trainers
+        obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
+        num_adversaries = min(env.n, arglist.num_adversaries)
+        trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+
+        print('Testing using good policy {} and adv policy {}'.format(
+            arglist.good_policy, arglist.adv_policy))
+
+        # Initialize TF graph
+        U.initialize()
+
+        # Load trained model
+        #if arglist.load_dir == "":
+        arglist.load_dir = arglist.save_dir
+        print('Loading trained model from {}'.format(arglist.load_dir))
+        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+
+        # Testing params
+        n_episodes = arglist.num_test_episodes
+        max_episode_len = arglist.max_episode_len
+        all_rewards = []
+
+        # --- Extra for disruption ---
+        env.llm_disturb_iteration = 0
+        env.previous_reward = 0
+
+        print('Starting testing with robustness perturbations...')
+
+        for ep in range(n_episodes):
+            obs_n = env.reset()
+            episode_reward = np.zeros(env.n)
+
+            for step in range(max_episode_len):
+                # get actions
+                action_n = [agent.action(obs) for agent, obs in zip(trainers, obs_n)]
+                
+                # environment step
+                new_obs_n, rew_n, done_n, info_n = env.step(action_n)
+
+                # === Apply your disruption here ===
+                disrupted_obs_n = []
+                # print("=================== before perturbation ===========")
+                # print(new_obs_n)
+                for i, obs in enumerate(new_obs_n):
+                    disrupted_obs_n.append(apply_observation_disruption(
+                        obs, rew_n[i], env, arglist
+                    ))
+
+                # print("=================== after perturbation ===========")
+                # print(np.array(disrupted_obs_n) - np.array(new_obs_n))
+
+                # track reward
+                episode_reward += rew_n
+
+                obs_n = disrupted_obs_n
+
+                if arglist.display:
+                    env.render()
+                    time.sleep(0.05)
+
+                if all(done_n):
+                    break
+
+            all_rewards.append(episode_reward)
+            # print("Episode {} reward (per agent): {}".format(ep + 1, episode_reward))
+
+        mean_rewards = np.mean(all_rewards, axis=0)
+        print("Average reward per agent over {} episodes: {}".format(n_episodes, mean_rewards))
+        print("Average total reward: {}".format(np.mean(np.sum(all_rewards, axis=1))))
+        return np.mean(np.sum(all_rewards, axis=1))
+
+
+def testRobustnessOA(arglist):
+    tf.reset_default_graph()
+    with U.single_threaded_session():
+        # Create environment
+        env = make_env(arglist.scenario, arglist, arglist.benchmark)
+
+        # Create agent trainers
+        obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
+        num_adversaries = min(env.n, arglist.num_adversaries)
+        trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+
+        print('Testing using good policy {} and adv policy {}'.format(
+            arglist.good_policy, arglist.adv_policy))
+
+        # Initialize TF graph
+        U.initialize()
+
+        # Load trained model
+        arglist.load_dir = arglist.save_dir
+        print('Loading trained model from {}'.format(arglist.load_dir))
+        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+
+        # Testing params
+        n_episodes = arglist.num_test_episodes
+        max_episode_len = arglist.max_episode_len
+        all_rewards = []
+
+        # --- Extra for disruption ---
+        env.llm_disturb_iteration = 0
+        env.previous_reward = 0
+
+        print('Starting testing with robustness perturbations...')
+
+        for ep in range(n_episodes):
+            obs_n = env.reset()
+            episode_reward = np.zeros(env.n)
+
+            for step in range(max_episode_len):
+                # --- Apply observation disruption before action selection ---
+                obs_n_disrupted = [
+                    apply_observation_disruption(obs, 0, env, arglist)
+                    for obs in obs_n
+                ]
+
+                # --- Get actions from agents ---
+                action_n = [
+                    agent.action(obs_dis)
+                    for agent, obs_dis in zip(trainers, obs_n_disrupted)
+                ]
+
+                # --- Apply action disruption ---
+                action_n_disrupted = [
+                    apply_action_disruption(action, 0, env, arglist)
+                    for action in action_n
+                ]
+
+                # --- Environment step ---
+                new_obs_n, rew_n, done_n, info_n = env.step(action_n_disrupted)
+
+                # --- Track reward ---
+                episode_reward += rew_n
+                obs_n = new_obs_n
+
+                # --- Render if needed ---
+                if arglist.display:
+                    env.render()
+                    time.sleep(0.05)
+
+                if all(done_n):
+                    break
+
+            all_rewards.append(episode_reward)
+            # print("Episode {} reward (per agent): {}".format(ep + 1, episode_reward))
+
+        mean_rewards = np.mean(all_rewards, axis=0)
+        print("Average reward per agent over {} episodes: {}".format(n_episodes, mean_rewards))
+        print("Average total reward: {}".format(np.mean(np.sum(all_rewards, axis=1))))
+        return np.mean(np.sum(all_rewards, axis=1))
+    
+def testRobustnessAP(arglist):
+    tf.reset_default_graph()
+    with U.single_threaded_session():
+        # Create environment
+        env = make_env(arglist.scenario, arglist, arglist.benchmark)
+
+        # Create agent trainers
+        obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
+        num_adversaries = min(env.n, arglist.num_adversaries)
+        trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+
+        print('Testing using good policy {} and adv policy {}'.format(
+            arglist.good_policy, arglist.adv_policy))
+
+        # Initialize TF graph
+        U.initialize()
+
+        # Load trained model
+        arglist.load_dir = arglist.save_dir
+        print('Loading trained model from {}'.format(arglist.load_dir))
+        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+
+        # Testing params
+        n_episodes = arglist.num_test_episodes
+        max_episode_len = arglist.max_episode_len
+        all_rewards = []
+
+        # --- Extra for disruption ---
+        env.llm_disturb_iteration = 0
+        env.previous_reward = 0
+
+        print('Starting testing with robustness perturbations...')
+
+        for ep in range(n_episodes):
+            obs_n = env.reset()
+            episode_reward = np.zeros(env.n)
+
+            for step in range(max_episode_len):
+
+                # --- Get actions from agents ---
+                action_n = [
+                    agent.action(obs_dis)
+                    for agent, obs_dis in zip(trainers, obs_n)
+                ]
+
+                # --- Apply action disruption ---
+                action_n_disrupted = [
+                    apply_action_disruption(action, 0, env, arglist)
+                    for action in action_n
+                ]
+
+                # --- Environment step ---
+                new_obs_n, rew_n, done_n, info_n = env.step(action_n_disrupted)
+
+                # --- Track reward ---
+                episode_reward += rew_n
+                obs_n = new_obs_n
+
+                # --- Render if needed ---
+                if arglist.display:
+                    env.render()
+                    time.sleep(0.05)
+
+                if all(done_n):
+                    break
+
+            all_rewards.append(episode_reward)
+            # print("Episode {} reward (per agent): {}".format(ep + 1, episode_reward))
+
+        mean_rewards = np.mean(all_rewards, axis=0)
+        print("Average reward per agent over {} episodes: {}".format(n_episodes, mean_rewards))
+        print("Average total reward: {}".format(np.mean(np.sum(all_rewards, axis=1))))
+        return np.mean(np.sum(all_rewards, axis=1))
+
+
+def apply_observation_disruption(observation, reward, env, args):
+    """
+    Apply noise or LLM-guided disruption to observation/reward.
+    Ensures the output is always a valid NumPy array.
+    """
+    # Keep track of iterations
+    env.llm_disturb_iteration += 1
+    obs_orig = np.array(observation, dtype=np.float32)
+
+    # === Apply noise ===
+    if args.noise_factor == "state" and env.llm_disturb_iteration % args.llm_disturb_interval == 0:
+        if args.noise_type == "gauss":
+            noise = np.random.normal(args.noise_mu, args.noise_sigma, size=obs_orig.shape)
+            # print(noise)
+            noise = 10*noise+5
+            obs_orig = obs_orig + noise
+        elif args.noise_type == "shift":
+            obs_orig = obs_orig + args.noise_shift
+        elif args.noise_type == "uniform":
+            noise = np.random.uniform(args.uniform_low, args.uniform_high, size=obs_orig.shape)
+            noise = 5*noise
+            obs_orig = obs_orig + noise
+
+    # === LLM-guided perturbation ===
+    if args.llm_guide == "adversary" and env.llm_disturb_iteration % args.llm_disturb_interval == 0:
+        prompt = (
+            "Robust RL adversary: Current reward = {}, previous reward = {}. "
+            "Revise this state: {}. Output only the revised state as a Python list."
+        ).format(reward, env.previous_reward, obs_orig.tolist())
+
+        obs_from_gpt = gpt_call(prompt)
+        if obs_from_gpt is not None:
+            try:
+                obs_from_gpt = np.array(eval(obs_from_gpt), dtype=np.float32)
+                # reshape/pad/truncate to match original observation
+                if obs_from_gpt.shape != obs_orig.shape:
+                    flat = obs_from_gpt.flatten()
+                    size_needed = np.prod(obs_orig.shape)
+                    if flat.size < size_needed:
+                        flat = np.pad(flat, (0, size_needed - flat.size), mode="constant")
+                    else:
+                        flat = flat[:size_needed]
+                    obs_from_gpt = flat.reshape(obs_orig.shape)
+                obs_orig = obs_from_gpt
+            except:
+                # fallback to original observation
+                pass
+
+    env.previous_reward = reward
+    return obs_orig
+
+
+def apply_action_disruption(action, reward, env, args):
+    env.llm_disturb_iteration += 1
+    action_orig = np.array(action, dtype=np.float32)
+
+    if args.noise_factor == "action" and env.llm_disturb_iteration % args.llm_disturb_interval == 0:
+        if args.noise_type == "gauss":
+            action_orig = action_orig + np.random.normal(args.noise_mu, args.noise_sigma, size=action_orig.shape)
+        elif args.noise_type == "shift":
+            action_orig = action_orig + args.noise_shift
+        elif args.noise_type == "uniform":
+            action_orig = action_orig + np.random.uniform(args.uniform_low, args.uniform_high, size=action_orig.shape)
+
+    if args.llm_guide == "adversary" and env.llm_disturb_iteration % args.llm_disturb_interval == 0:
+        prompt = (
+            "Robust RL adversary: Current reward = {}, previous reward = {}. "
+            "Revise this action: {}. Output only the revised action as a Python list."
+        ).format(reward, env.previous_reward, action_orig.tolist())
+        action_from_gpt = gpt_call(prompt)
+        if action_from_gpt is not None:
+            try:
+                action_from_gpt = np.array(eval(action_from_gpt), dtype=np.float32)
+                if action_from_gpt.shape != action_orig.shape:
+                    flat = action_from_gpt.flatten()
+                    size_needed = np.prod(action_orig.shape)
+                    if flat.size < size_needed:
+                        flat = np.pad(flat, (0, size_needed - flat.size), mode="constant")
+                    else:
+                        flat = flat[:size_needed]
+                    action_from_gpt = flat.reshape(action_orig.shape)
+                action_orig = action_from_gpt
+            except:
+                pass
+
+    env.previous_reward = reward
+    return action_orig
+
+
 if __name__ == '__main__':
     arglist = parse_args()
     # train(arglist)
     if arglist.mode == "train":
         seed_list = [1]  # list of random seeds for multiple runs
         train_multiple_runs(arglist, seed_list)
+    else:
+        all_results = []
+
+        for run_id in range(arglist.num_test_runs):
+            print("\n================ Run {}/{} ================".format(run_id + 1, arglist.num_test_runs))
+            run_results = {"run": run_id + 1}
+
+            # baseline (no noise)
+            rew = testWithoutP(arglist)
+            run_results["none"] = rew
+
+            for noise in ["gauss", "shift", "uniform"]:
+                arglist.noise_type = noise
+
+                rew = testRobustnessOP(arglist)
+                run_results["{}_obs_only".format(noise)] = rew
+
+                rew = testRobustnessAP(arglist)
+                run_results["{}_act_only".format(noise)] = rew
+
+                rew = testRobustnessOA(arglist)
+                run_results["{}_obs+action".format(noise)] = rew
+
+            all_results.append(run_results)
+
+        # convert to dataframe
+        df = pd.DataFrame(all_results)
+
+        # save to CSV
+        exp_name = arglist.exp_name if arglist.exp_name is not None else "default_exp"
+        df.to_csv(exp_name +"_test_rewards.csv", index=False)
 
 # from send_email import *
 # if __name__ == '__main__':
