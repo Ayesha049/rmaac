@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--noise-policy", type=str, default="rmaac", help="policy of state perturbation adversaries")
     # Core training parameters
     parser.add_argument("--lr", type=float, default=1e-2, help="learning rate for Agent Adam optimizer")
-    parser.add_argument("--lr-adv", type=float, default=1e-2, help="learning rate for State Perturbation Adversary Adam optimizer")
+    parser.add_argument("--lr-adv", type=float, default=1e-3, help="learning rate for State Perturbation Adversary Adam optimizer")
     parser.add_argument("--gamma", type=float, default=0.95, help="discount factor")
     parser.add_argument("--batch-size", type=int, default=1024, help="number of episodes to optimize at the same time")
     parser.add_argument("--num-units", type=int, default=64, help="number of units in the mlp")
@@ -57,7 +57,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
     parser.add_argument("--mode", choices=["train", "test"], default="train", help="Run mode: 'train' to train agents, 'test' to run evaluation")
-    parser.add_argument("--num_test_runs", type=int, default=5, help="Number of test runs to perform when in test mode")
+    parser.add_argument("--adv-type", choices=["obs", "act", "both"], default="obs", help="Adversary Type: 'obs' state uncertainity, 'act' action uncertainity, 'both' action+state uncertainity")
+    parser.add_argument("--num-test-runs", type=int, default=5, help="Number of test runs to perform when in test mode")
 
     # State Perturbation
     parser.add_argument("--noise-type", type=str, default="Linear", help="Linear, Gaussian")
@@ -203,11 +204,47 @@ def get_adversaries(env, obs_shape_n, arglist):
     p_model = mlp_model_adv_arg
     q_model = mlp_model
     adversary = MADDPGAgentTrainer
-    observation_space = [gym.spaces.Discrete(env.observation_space[i].shape[0]) for i in range(env.n)]
-    # print(observation_space)
+    # observation_space = [gym.spaces.Discrete(env.observation_space[i].shape[0]) for i in range(env.n)]
+    # action_space = [gym.spaces.Discrete(env.action_space[i].shape[0]) for i in range(env.n)]
+
+    if arglist.adv_type == "obs":
+        act_space = env.observation_space
+    elif arglist.adv_type == "act":
+        act_space = env.action_space
+    else:
+        combined_spaces = []
+        for obs_space, act_space in zip(env.observation_space, env.action_space):
+            # Observation dimension
+            if isinstance(obs_space, gym.spaces.Box):
+                obs_dim = np.prod(obs_space.shape)
+                obs_low = obs_space.low
+                obs_high = obs_space.high
+            else:
+                raise ValueError("Observation space must be Box")
+
+            # Action dimension
+            if isinstance(act_space, gym.spaces.Box):
+                act_dim = np.prod(act_space.shape)
+                act_low = act_space.low
+                act_high = act_space.high
+            elif isinstance(act_space, gym.spaces.Discrete):
+                act_dim = act_space.n
+                # represent discrete actions as one-hot continuous vector ∈ [0,1]
+                act_low = np.zeros(act_dim)
+                act_high = np.ones(act_dim)
+            else:
+                raise ValueError("Unsupported action space type:")
+
+            # Combine both into a single Box
+            low = np.concatenate([obs_low.flatten(), act_low])
+            high = np.concatenate([obs_high.flatten(), act_high])
+            combined = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+            combined_spaces.append(combined)
+            act_space = combined_spaces
+
     for i in range(env.n):
         adversaries.append(adversary(
-            "r_adversary_%d" % i, p_model, q_model, obs_shape_n, env.observation_space, env.observation_space, i, arglist,
+            "r_adversary_%d" % i, p_model, q_model, obs_shape_n, env.observation_space, act_space, i, arglist,
             local_q_func=(arglist.noise_policy=='ddpg'), ADV=True))
     return adversaries
 
@@ -441,25 +478,91 @@ def train_multiple_runs(arglist, seed_list):
             print('Starting iterations...')
             while len(episode_rewards) <= arglist.num_episodes:
                 
-                adv_action_n = [adv.action(obs) for adv, obs in zip(adversaries,obs_n)]
+                adv_out_n = [adv.action(obs) for adv, obs in zip(adversaries,obs_n)]
                 # adv_action_n = np.array(adv_action_n)
                 # adv_action_n = np.clip(adv_action_n, a_min = -arglist.constraint_epsilon, a_max = arglist.constraint_epsilon)
-                adv_action_n = [np.clip(a, -arglist.constraint_epsilon, arglist.constraint_epsilon) for a in adv_action_n]
+                adv_out_n = [np.clip(a, -arglist.constraint_epsilon, arglist.constraint_epsilon) for a in adv_out_n]
                 # print("==========adversory actions=======", adv_action_n)
-                if arglist.noise_type == "Linear":
-                    # print("Use Linear Noise")
-                    disturbed_obs_n = [act+obs for act, obs in zip(adv_action_n,obs_n)]
-                elif arglist.noise_type == "Gaussian":
-                    # print("Use Gaussian Noise")
-                    noise_n = get_noise(adv_action_n = adv_action_n, var = arglist.noise_variance)
-                    disturbed_obs_n = [act+obs for act, obs in zip(noise_n,obs_n)]
+
+                disturbed_obs_n = []
+                disturbed_action_n = []
+
+                if arglist.adv_type == "obs":
+                    if arglist.noise_type == "Linear":
+                        # print("Use Linear Noise")
+                        disturbed_obs_n = [act+obs for act, obs in zip(adv_out_n,obs_n)]
+                    elif arglist.noise_type == "Gaussian":
+                        # print("Use Gaussian Noise")
+                        noise_n = get_noise(adv_action_n = adv_out_n, var = arglist.noise_variance)
+                        disturbed_obs_n = [act+obs for act, obs in zip(noise_n,obs_n)]
+                    else:
+                        print("No noise")
+                    action_n = [agent.action(obs) for agent, obs in zip(trainers,disturbed_obs_n)]
+                    disturbed_action_n = action_n
+                elif arglist.adv_type == "act":
+                    # get action
+                    disturbed_obs_n = obs_n
+                    action_n = [agent.action(obs) for agent, obs in zip(trainers,disturbed_obs_n)]
+                    # --- apply Δact from adversary ---
+                    # disturbed_action_n = [np.clip(0.8*a + 0.2*da, -1, 1)  # clip to env limits
+                            # for a, da in zip(action_n, disturbed_action_n)]
+                    # action_n = [agent.action(obs) for agent, obs in zip(trainers,obs_n)]
+                    # environment step
+                    if arglist.noise_type == "Linear":
+                        # print("Use Linear Noise")
+                        disturbed_action_n = [act+obs for act, obs in zip(adv_out_n,action_n)]
+                    elif arglist.noise_type == "Gaussian":
+                        # print("Use Gaussian Noise")
+                        noise_n = get_noise(adv_action_n = adv_out_n, var = arglist.noise_variance)
+                        disturbed_action_n = [act+obs for act, obs in zip(noise_n,action_n)]
+                    else:
+                        print("No noise")
                 else:
-                    print("No noise")
-                # get action
-                action_n = [agent.action(obs) for agent, obs in zip(trainers,disturbed_obs_n)]
-                # action_n = [agent.action(obs) for agent, obs in zip(trainers,obs_n)]
-                # environment step
-                new_obs_n, rew_n, done_n, info_n = env.step(action_n)
+                    for i, adv_out in enumerate(adv_out_n):
+                        # --- get dimensions ---
+                        
+                        # --- Get observation and action dimensions safely ---
+                        space_obs = env.observation_space[i] if isinstance(env.observation_space, list) else env.observation_space
+                        space_act = env.action_space[i] if isinstance(env.action_space, list) else env.action_space
+
+                        if isinstance(space_obs, gym.spaces.Box):
+                            obs_dim = space_obs.shape[0]
+                        else:
+                            raise ValueError("Unsupported observation space type: {}".format(type(space_obs)))
+
+                        if isinstance(space_act, gym.spaces.Box):
+                            act_dim = space_act.shape[0]
+                        elif isinstance(space_act, gym.spaces.Discrete):
+                            act_dim = space_act.n
+                        else:
+                            raise ValueError("Unsupported action space type: {}".format(type(space_act)))
+
+
+                        # --- slice the adversary output ---
+                        delta_obs = adv_out[:obs_dim]
+                        delta_act = adv_out[obs_dim:]
+
+                        # --- reshape in case flattened ---
+                        delta_obs = np.reshape(delta_obs, obs_n[i].shape)
+                        delta_act = np.reshape(delta_act, (act_dim,))
+
+                        # --- add perturbations ---
+                        disturbed_obs = obs_n[i] + delta_obs
+                        disturbed_action = None  # will be applied after agent action
+
+                        disturbed_obs_n.append(disturbed_obs)
+                        disturbed_action_n.append(delta_act)  # store Δact for later
+                    
+
+                    # Optional debug print
+                    # print(f"[ADV{i}] adv_out={adv_out.shape}, Δobs={delta_obs.shape}, Δact={delta_act.shape}")
+                    action_n = [agent.action(obs) for agent, obs in zip(trainers,disturbed_obs_n)]
+                    # --- apply Δact from adversary ---
+                    disturbed_action_n = [np.clip(0.8*a + 0.2*da, -1, 1)  # clip to env limits
+                            for a, da in zip(action_n, disturbed_action_n)]
+
+                
+                new_obs_n, rew_n, done_n, info_n = env.step(disturbed_action_n)
                 episode_step += 1
                 done = all(done_n)
                 terminal = (episode_step >= arglist.max_episode_len)
@@ -474,7 +577,7 @@ def train_multiple_runs(arglist, seed_list):
 
                 
                 for i, adv in enumerate(adversaries):
-                    adv.experience(obs_n[i], adv_action_n[i], -rew_n[i], new_obs_n[i], done_n[i], terminal)
+                    adv.experience(obs_n[i], adv_out_n[i], -rew_n[i], new_obs_n[i], done_n[i], terminal)
                 for i, rew in enumerate(rew_n):
                     adversary_rewards[i][-1] += -rew
 
