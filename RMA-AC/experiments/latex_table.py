@@ -1,7 +1,7 @@
 import pandas as pd
 
 # === Load CSV ===
-df = pd.read_csv("ccRun1_test_rewards.csv")
+df = pd.read_csv("ppSARRun3best_test_rewards.csv")
 
 # Rename columns if needed (optional)
 col_map = {
@@ -72,7 +72,7 @@ latex.append("\\hline")
 
 latex.append("\\end{tabular}")
 latex.append("\\vspace{2mm}")
-latex.append("\\caption{\\textbf{RMA-AC-\\textcolor{green}{taking best rewarding model}} - evaluation on 1000 episodes with observation and/or action perturbation with different noises on \\textbf{MPE Cooperative Communication scenario}}")
+latex.append("\\caption{\\textbf{RMA-AC-State+Action Robust\\textcolor{green}{taking best rewarding model}} - evaluation on 1000 episodes with observation and/or action perturbation with different noises on \\textbf{MPE Cooperative Communication scenario}}")
 latex.append("\\end{table*}")
 
 # === Print or Save ===
