@@ -68,6 +68,19 @@ def parse_args():
     parser.add_argument("--run-id", type=int, default=0, help="ID of the run for multiple seeds")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
+    parser.add_argument("--baseline-load-dir", type=str, default=None,
+                        help="checkpoint directory for the clean/base model used in comparisons")
+    parser.add_argument("--baseline-exp-name", type=str, default=None,
+                        help="checkpoint name for the clean/base model used in comparisons")
+    parser.add_argument("--adv-load-dir", type=str, default=None,
+                        help="checkpoint directory for the adversarially trained model used in comparisons")
+    parser.add_argument("--adv-exp-name", type=str, default=None,
+                        help="checkpoint name for the adversarially trained model used in comparisons")
+    parser.add_argument("--compare-baseline-adv", action="store_true", default=False,
+                        help="when testing, compare base-noisy, adv-noisy, and adv+diffusion in one sweep")
+    parser.add_argument("--t-start-list", type=int, nargs="*", default=[20, 40, 60],
+                        help="diffusion reverse step starts to sweep during comparison/test")
+
      # parser.add_argument("--mode", choices=["train", "test"], default="train", help="Run mode: 'train' to train agents, 'test' to run evaluation")
     parser.add_argument(
     "--mode",
@@ -79,8 +92,9 @@ def parse_args():
          "  'collect_diffusion': roll out trained MADDPG and save trajectories\n"
          "  'train_diffusion' : train diffusion model on saved trajectories"
     )
-    parser.add_argument("--adv-type", choices=["obs", "act", "both"], default="obs", help="Adversary Type: 'obs' state uncertainity, 'act' action uncertainity, 'both' action+state uncertainity")
+    parser.add_argument("--adv-type", choices=["none", "obs", "act", "both"], default="obs", help="Adversary Type: 'none' clean training, 'obs' state uncertainity, 'act' action uncertainity, 'both' action+state uncertainity")
     parser.add_argument("--num-test-runs", type=int, default=3, help="Number of test runs to perform when in test mode")
+    parser.add_argument("--skip-diffusion", action="store_true", default=False, help="skip diffusion denoising during test mode")
 
     # State Perturbation
     parser.add_argument("--noise-type", type=str, default="Linear", help="Linear, Gaussian")
@@ -211,6 +225,15 @@ def get_noise(adv_action_n, var):
         noise.append(np.random.normal(adv_action_n[i], var)) 
     return np.array(noise)
 
+
+def resolve_checkpoint(arglist, load_dir=None, exp_name=None):
+    resolved_load_dir = arglist.load_dir if load_dir is None else load_dir
+    if resolved_load_dir == "":
+        resolved_load_dir = arglist.save_dir
+
+    resolved_exp_name = arglist.exp_name if exp_name is None else exp_name
+    return resolved_load_dir, resolved_exp_name
+
 def make_env(scenario_name, arglist, benchmark=False):
     from multiagent.environment import MultiAgentEnv
     import multiagent.scenarios as scenarios
@@ -244,6 +267,9 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
 
 def get_adversaries(env, obs_shape_n, arglist):
     adversaries = []
+
+    if arglist.adv_type == "none":
+        return adversaries
 
     def mlp_model_adv_arg(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=None, constraint_epsilon = arglist.constraint_epsilon):
         # This model takes as input an observation and returns values of all actions
@@ -356,7 +382,11 @@ def train(arglist):
             # adv_action_n = np.clip(adv_action_n, a_min = -arglist.constraint_epsilon, a_max = arglist.constraint_epsilon)
             adv_action_n = [np.clip(a, -arglist.constraint_epsilon, arglist.constraint_epsilon) for a in adv_action_n]
             # print("==========adversory actions=======", adv_action_n)
-            if arglist.noise_type == "Linear":
+            if arglist.adv_type == "none":
+                disturbed_obs_n = obs_n
+                action_n = [agent.action(obs) for agent, obs in zip(trainers, disturbed_obs_n)]
+                disturbed_action_n = [np.clip(a, -1.0, 1.0) for a in action_n]
+            elif arglist.noise_type == "Linear":
                 # print("Use Linear Noise")
                 disturbed_obs_n = [act+obs for act, obs in zip(adv_action_n,obs_n)]
             elif arglist.noise_type == "Gaussian":
@@ -541,7 +571,11 @@ def train_multiple_runs(arglist, seed_list):
                 disturbed_obs_n = []
                 disturbed_action_n = []
 
-                if arglist.adv_type == "obs":
+                if arglist.adv_type == "none":
+                    disturbed_obs_n = obs_n
+                    action_n = [agent.action(obs) for agent, obs in zip(trainers, disturbed_obs_n)]
+                    disturbed_action_n = [np.clip(a, -1.0, 1.0) for a in action_n]
+                elif arglist.adv_type == "obs":
                     if arglist.noise_type == "Linear":
                         # print("Use Linear Noise")
                         disturbed_obs_n = [act+obs for act, obs in zip(adv_out_n,obs_n)]
@@ -616,13 +650,14 @@ def train_multiple_runs(arglist, seed_list):
                             for a, da in zip(action_n, disturbed_action_n)]
 
                 
+                prev_obs_n = obs_n
                 new_obs_n, rew_n, done_n, info_n = env.step(disturbed_action_n)
                 episode_step += 1
                 done = all(done_n)
                 terminal = (episode_step >= arglist.max_episode_len)
                 # collect experience
                 for i, agent in enumerate(trainers):
-                    agent.experience(obs_n[i], action_n[i], rew_n[i], new_obs_n[i], done_n[i], terminal)
+                    agent.experience(prev_obs_n[i], disturbed_action_n[i], rew_n[i], new_obs_n[i], done_n[i], terminal)
                 obs_n = new_obs_n
 
                 for i, rew in enumerate(rew_n):
@@ -631,7 +666,7 @@ def train_multiple_runs(arglist, seed_list):
 
                 
                 for i, adv in enumerate(adversaries):
-                    adv.experience(obs_n[i], adv_out_n[i], -rew_n[i], new_obs_n[i], done_n[i], terminal)
+                    adv.experience(prev_obs_n[i], adv_out_n[i], -rew_n[i], new_obs_n[i], done_n[i], terminal)
                 for i, rew in enumerate(rew_n):
                     adversary_rewards[i][-1] += -rew
 
@@ -750,7 +785,7 @@ def train_multiple_runs(arglist, seed_list):
     print("Saved concatenated mean episode rewards for all runs to {}".format(csv_file))
 
 
-def testWithoutP(arglist):
+def testWithoutP(arglist, load_dir=None, exp_name=None):
     tf.reset_default_graph()
     with U.single_threaded_session():
         # Create environment
@@ -768,10 +803,9 @@ def testWithoutP(arglist):
         U.initialize()
 
         # Load trained model
-        #if arglist.load_dir == "":
-        arglist.load_dir = arglist.save_dir
-        print('Loading trained model from {}'.format(arglist.load_dir))
-        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+        load_dir, exp_name = resolve_checkpoint(arglist, load_dir, exp_name)
+        print('Loading trained model from {}'.format(load_dir))
+        U.load_state(load_dir, exp_name=exp_name)
 
         # Parameters for testing
         n_episodes = arglist.num_test_episodes
@@ -807,7 +841,7 @@ def testWithoutP(arglist):
         return np.mean(np.sum(all_rewards, axis=1))
 
 
-def testRobustnessOP(arglist):
+def testRobustnessOP(arglist, load_dir=None, exp_name=None):
     tf.reset_default_graph()
     with U.single_threaded_session():
         # Create environment
@@ -825,10 +859,9 @@ def testRobustnessOP(arglist):
         U.initialize()
 
         # Load trained model
-        #if arglist.load_dir == "":
-        arglist.load_dir = arglist.save_dir
-        print('Loading trained model from {}'.format(arglist.load_dir))
-        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+        load_dir, exp_name = resolve_checkpoint(arglist, load_dir, exp_name)
+        print('Loading trained model from {}'.format(load_dir))
+        U.load_state(load_dir, exp_name=exp_name)
 
         # Testing params
         n_episodes = arglist.num_test_episodes
@@ -898,7 +931,7 @@ def testRobustnessOP(arglist):
         return np.mean(np.sum(all_rewards, axis=1))
 
 
-def testRobustnessOA(arglist):
+def testRobustnessOA(arglist, load_dir=None, exp_name=None):
     tf.reset_default_graph()
     with U.single_threaded_session():
         # Create environment
@@ -916,9 +949,9 @@ def testRobustnessOA(arglist):
         U.initialize()
 
         # Load trained model
-        arglist.load_dir = arglist.save_dir
-        print('Loading trained model from {}'.format(arglist.load_dir))
-        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
+        load_dir, exp_name = resolve_checkpoint(arglist, load_dir, exp_name)
+        print('Loading trained model from {}'.format(load_dir))
+        U.load_state(load_dir, exp_name=exp_name)
 
         # Testing params
         n_episodes = arglist.num_test_episodes
@@ -986,7 +1019,7 @@ def testRobustnessOA(arglist):
         print("Average total reward: {}".format(np.mean(np.sum(all_rewards, axis=1))))
         return np.mean(np.sum(all_rewards, axis=1))
     
-def testRobustnessAP(arglist, deffusion=True, t_start=40):
+def testRobustnessAP(arglist, deffusion=True, t_start=40, load_dir=None, exp_name=None):
     tf.reset_default_graph()
     with U.single_threaded_session():
         # Create environment
@@ -1004,10 +1037,11 @@ def testRobustnessAP(arglist, deffusion=True, t_start=40):
         U.initialize()
 
         # Load trained model
-        arglist.load_dir = arglist.save_dir
-        print('Loading trained model from {}'.format(arglist.load_dir))
-        U.load_state(arglist.load_dir, exp_name=arglist.exp_name)
-        load_diffusion_model(arglist)
+        load_dir, exp_name = resolve_checkpoint(arglist, load_dir, exp_name)
+        print('Loading trained model from {}'.format(load_dir))
+        U.load_state(load_dir, exp_name=exp_name)
+        if deffusion:
+            load_diffusion_model(arglist)
 
         # Testing params
         n_episodes = arglist.num_test_episodes
@@ -1496,10 +1530,126 @@ def apply_action_disruption(action, reward, env, args):
     elif args.noise_type == "uniform":
         action_orig = action_orig + np.random.uniform(args.uniform_low, args.uniform_high, size=action_orig.shape)
 
-    return action_orig
+    return np.clip(action_orig, -1.0, 1.0)
 
 def r2(x):
     return "{:.2f}".format(float(x))
+
+
+def run_action_noise_comparison(arglist):
+    baseline_load_dir, baseline_exp_name = resolve_checkpoint(
+        arglist,
+        arglist.baseline_load_dir,
+        arglist.baseline_exp_name,
+    )
+    adv_load_dir, adv_exp_name = resolve_checkpoint(
+        arglist,
+        arglist.adv_load_dir,
+        arglist.adv_exp_name,
+    )
+
+    act_std_list = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0]
+    t_start_list = arglist.t_start_list
+
+    exp_name = arglist.exp_name if arglist.exp_name is not None else "default_exp"
+    csv_filename = "{}_compare_actstd_tstart_sweep.csv".format(exp_name)
+    results = []
+
+    reward_clean = testWithoutP(
+        arglist,
+        load_dir=baseline_load_dir,
+        exp_name=baseline_exp_name,
+    )
+    print("Baseline (clean/no noise): {:.3f}".format(reward_clean))
+
+    for act_std in act_std_list:
+        arglist.act_noise = act_std
+        print("\n=== Action noise std = {} ===".format(act_std))
+
+        reward_base_noisy = testRobustnessAP(
+            arglist,
+            deffusion=False,
+            load_dir=baseline_load_dir,
+            exp_name=baseline_exp_name,
+        )
+        print("  Base model noisy reward: {:.3f}".format(reward_base_noisy))
+
+        reward_adv_noisy = testRobustnessAP(
+            arglist,
+            deffusion=False,
+            load_dir=adv_load_dir,
+            exp_name=adv_exp_name,
+        )
+        print("  Adv model noisy reward: {:.3f}".format(reward_adv_noisy))
+
+        row = [
+            r2(act_std),
+            r2(reward_clean),
+            r2(reward_base_noisy),
+            r2(reward_adv_noisy),
+        ]
+
+        if not arglist.skip_diffusion:
+            diff_rewards = {}
+
+            for t_start in t_start_list:
+                print("  -> t_start = {}".format(t_start))
+                reward_adv_diff = testRobustnessAP(
+                    arglist,
+                    deffusion=True,
+                    t_start=t_start,
+                    load_dir=adv_load_dir,
+                    exp_name=adv_exp_name,
+                )
+                diff_rewards[t_start] = reward_adv_diff
+                print(
+                    "     adv model + diffusion (t_start={}): {:.3f}".format(
+                        t_start, reward_adv_diff
+                    )
+                )
+
+            best_diff_reward = max(diff_rewards.values())
+            pct_inc_vs_adv_no_diff = (
+                (best_diff_reward - reward_adv_noisy) / abs(reward_adv_noisy)
+            ) * 100.0 if reward_adv_noisy != 0 else 0.0
+            pct_inc_vs_base_noisy = (
+                (best_diff_reward - reward_base_noisy) / abs(reward_base_noisy)
+            ) * 100.0 if reward_base_noisy != 0 else 0.0
+
+            for t_start in t_start_list:
+                row.append(r2(diff_rewards[t_start]))
+
+            row.extend([
+                r2(best_diff_reward),
+                r2(pct_inc_vs_adv_no_diff),
+                r2(pct_inc_vs_base_noisy),
+            ])
+
+        results.append(row)
+
+    header = [
+        "action_noise_std",
+        "reward_clean_no_noise",
+        "reward_base_noise_no_diffusion",
+        "reward_adv_noise_no_diffusion",
+    ]
+
+    if not arglist.skip_diffusion:
+        for t_start in t_start_list:
+            header.append("reward_adv_with_diff_t{}".format(t_start))
+
+        header.extend([
+            "best_reward_adv_with_diffusion",
+            "pct_inc_vs_adv_no_diffusion",
+            "pct_inc_vs_base_noisy",
+        ])
+
+    with open(csv_filename, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(results)
+
+    print("Saved comparison results to {}".format(csv_filename))
 
 
 if __name__ == '__main__':
@@ -1511,102 +1661,108 @@ if __name__ == '__main__':
 
     elif arglist.mode == "test":
         arglist.noise_type = "gauss"
-        act_std_list = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0]
-        t_start_list = [20, 40, 60]
 
-        csv_filename = "{}_actstd_tstart_sweep.csv".format(arglist.exp_name)
-        results = []
+        if arglist.compare_baseline_adv:
+            run_action_noise_comparison(arglist)
+        else:
+            act_std_list = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0]
+            t_start_list = arglist.t_start_list
 
-        # Baseline (no noise, no diffusion)
-        rew_no_noise = testWithoutP(arglist)
-        print("Baseline (no noise): {:.3f}".format(rew_no_noise))
+            csv_filename = "{}_actstd_tstart_sweep.csv".format(arglist.exp_name)
+            results = []
 
-        for act_std in act_std_list:
-            arglist.act_noise = act_std
-            print("\n=== Action noise std = {} ===".format(act_std))
+            # Baseline (no noise, no diffusion)
+            rew_no_noise = testWithoutP(arglist)
+            print("Baseline (no noise): {:.3f}".format(rew_no_noise))
 
-            # Noise, no diffusion
-            rew_no_diff = testRobustnessAP(
-                arglist,
-                deffusion=False
-            )
+            for act_std in act_std_list:
+                arglist.act_noise = act_std
+                print("\n=== Action noise std = {} ===".format(act_std))
 
-            print("  No diffusion reward: {:.3f}".format(rew_no_diff))
-
-            # Store diffusion rewards per t_start
-            diff_rewards = {}
-
-            for t_start in t_start_list:
-                print("  -> t_start = {}".format(t_start))
-
-                rew_with_diff = testRobustnessAP(
+                # Noise, no diffusion
+                rew_no_diff = testRobustnessAP(
                     arglist,
-                    deffusion=True,
-                    t_start=t_start
+                    deffusion=False
                 )
 
-                diff_rewards[t_start] = rew_with_diff
+                print("  No diffusion reward: {:.3f}".format(rew_no_diff))
 
-                print(
-                    "     with diffusion (t_start={}): {:.3f}".format(
-                        t_start, rew_with_diff
-                    )
-                )
+                # Assemble row
+                row = [
+                    r2(act_std),
+                    r2(rew_no_noise),
+                    r2(rew_no_diff)
+                ]
 
-            # Derived metrics
-            best_diff_reward = max(diff_rewards.values())
+                if not arglist.skip_diffusion:
+                    # Store diffusion rewards per t_start
+                    diff_rewards = {}
 
-            pct_inc_vs_no_diff = (
-                (best_diff_reward - rew_no_diff) / abs(rew_no_diff)
-            ) * 100.0
+                    for t_start in t_start_list:
+                        print("  -> t_start = {}".format(t_start))
 
-            pct_inc_vs_no_noise = (
-                (best_diff_reward - rew_no_noise) / abs(rew_no_noise)
-            ) * 100.0
+                        rew_with_diff = testRobustnessAP(
+                            arglist,
+                            deffusion=True,
+                            t_start=t_start
+                        )
 
-            # Assemble row
-            row = [
-                r2(act_std),
-                r2(rew_no_noise),
-                r2(rew_no_diff)
+                        diff_rewards[t_start] = rew_with_diff
+
+                        print(
+                            "     with diffusion (t_start={}): {:.3f}".format(
+                                t_start, rew_with_diff
+                            )
+                        )
+
+                    # Derived metrics
+                    best_diff_reward = max(diff_rewards.values())
+
+                    pct_inc_vs_no_diff = (
+                        (best_diff_reward - rew_no_diff) / abs(rew_no_diff)
+                    ) * 100.0
+
+                    pct_inc_vs_no_noise = (
+                        (best_diff_reward - rew_no_noise) / abs(rew_no_noise)
+                    ) * 100.0
+
+                    for t_start in t_start_list:
+                        row.append(r2(diff_rewards[t_start]))
+
+                    row.extend([
+                        r2(best_diff_reward),
+                        r2(pct_inc_vs_no_diff),
+                        r2(pct_inc_vs_no_noise)
+                    ])
+
+                results.append(row)
+
+
+            # -----------------------------
+            # Dynamic CSV header
+            # -----------------------------
+            header = [
+                "action_noise_std",
+                "reward_no_noise",
+                "reward_noise_no_diffusion"
             ]
 
-            for t_start in t_start_list:
-                row.append(r2(diff_rewards[t_start]))
+            if not arglist.skip_diffusion:
+                for t_start in t_start_list:
+                    header.append("reward_with_diff_t{}".format(t_start))
 
-            row.extend([
-                r2(best_diff_reward),
-                r2(pct_inc_vs_no_diff),
-                r2(pct_inc_vs_no_noise)
-            ])
+                header.extend([
+                    "best_reward_with_diffusion",
+                    "pct_inc_vs_no_diffusion",
+                    "pct_inc_vs_no_noise_worst"
+                ])
 
-            results.append(row)
+            with open(csv_filename, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(results)
 
-
-        # -----------------------------
-        # Dynamic CSV header
-        # -----------------------------
-        header = [
-            "action_noise_std",
-            "reward_no_noise",
-            "reward_noise_no_diffusion"
-        ]
-
-        for t_start in t_start_list:
-            header.append("reward_with_diff_t{}".format(t_start))
-
-        header.extend([
-            "best_reward_with_diffusion",
-            "pct_inc_vs_no_diffusion",
-            "pct_inc_vs_no_noise_worst"
-        ])
-
-        with open(csv_filename, mode="w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            writer.writerows(results)
-
-        print("Saved robustness results to {}".format(csv_filename))
+            print("Saved robustness results to {}".format(csv_filename))
 
 
     elif arglist.mode == "collect_diffusion":

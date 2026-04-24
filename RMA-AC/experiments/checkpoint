@@ -1,3 +1,3 @@
-model_checkpoint_path: "modelppaoRun2"
-all_model_checkpoint_paths: "modelppaoRun2best"
-all_model_checkpoint_paths: "modelppaoRun2"
+model_checkpoint_path: "modelsimple_crypto__adv_act"
+all_model_checkpoint_paths: "modelsimple_crypto__adv_actbest"
+all_model_checkpoint_paths: "modelsimple_crypto__adv_act"
