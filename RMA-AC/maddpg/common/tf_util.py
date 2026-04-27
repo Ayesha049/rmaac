@@ -225,8 +225,63 @@ def absolute_scope_name(relative_scope_name):
 
 def load_state(fname, saver=None, exp_name=None):
     """Load all the variables to the current session from the location <fname>"""
+    def _is_checkpoint_prefix(path_prefix):
+        return tf.gfile.Exists(path_prefix + ".index") or tf.gfile.Exists(path_prefix + ".meta")
+
+    def _resolve_ckpt_path_from_hint(base_dir, ckpt_hint):
+        if ckpt_hint is None:
+            return None
+
+        hint = os.path.normpath(ckpt_hint)
+        if _is_checkpoint_prefix(hint):
+            return hint
+
+        joined = os.path.normpath(os.path.join(base_dir, ckpt_hint))
+        if _is_checkpoint_prefix(joined):
+            return joined
+
+        parent_joined = os.path.normpath(os.path.join(os.path.dirname(base_dir), ckpt_hint))
+        if _is_checkpoint_prefix(parent_joined):
+            return parent_joined
+
+        return hint
+
+    def _resolve_existing_checkpoint(base_path):
+        if _is_checkpoint_prefix(base_path):
+            return base_path
+
+        if tf.gfile.Exists(base_path) and tf.gfile.IsDirectory(base_path):
+            ckpt_state = tf.train.get_checkpoint_state(base_path)
+            if ckpt_state is not None and ckpt_state.model_checkpoint_path:
+                return _resolve_ckpt_path_from_hint(base_path, ckpt_state.model_checkpoint_path)
+
+        return None
+
     if(exp_name is not None):
-        fname = fname + exp_name
+        candidate = os.path.join(fname, exp_name)
+        legacy_candidate = fname + exp_name
+        dir_legacy_candidate = os.path.join(os.path.basename(fname), exp_name)
+        dir_legacy_candidate = os.path.join(os.path.dirname(fname), dir_legacy_candidate)
+        for path in (candidate, legacy_candidate, dir_legacy_candidate):
+            resolved = _resolve_existing_checkpoint(path)
+            if resolved is not None:
+                fname = resolved
+                break
+        else:
+            recursive_choice = None
+            if tf.gfile.Exists(fname) and tf.gfile.IsDirectory(fname):
+                for root, _, files in os.walk(fname):
+                    if "checkpoint" in files:
+                        ckpt_state = tf.train.get_checkpoint_state(root)
+                        if ckpt_state is not None and ckpt_state.model_checkpoint_path:
+                            recursive_choice = _resolve_ckpt_path_from_hint(root, ckpt_state.model_checkpoint_path)
+                            break
+            fname = recursive_choice if recursive_choice is not None else candidate
+
+    resolved = _resolve_existing_checkpoint(fname)
+    if resolved is not None:
+        fname = resolved
+
     if saver is None:
         saver = tf.train.Saver()
     saver.restore(get_session(), fname)
@@ -237,9 +292,10 @@ def save_state(fname, saver=None, exp_name=None):
     """Save all the variables in the current session to the location <fname>"""
     print("==============saving the model rma-ac========================")
 
-    os.makedirs(os.path.dirname(fname), exist_ok=True)
     if(exp_name is not None):
-        fname = fname + exp_name
+        fname = os.path.join(fname, exp_name)
+
+    os.makedirs(os.path.dirname(fname), exist_ok=True)
 
     if saver is None:
         saver = tf.train.Saver()

@@ -1,0 +1,7 @@
+action_noise_std,reward_clean_no_noise,reward_base_noise_no_diffusion,reward_adv_noise_no_diffusion,reward_adv_with_diff_t20,reward_adv_with_diff_t40,reward_adv_with_diff_t60,best_reward_adv_with_diffusion,pct_inc_vs_adv_no_diffusion,pct_inc_vs_base_noisy
+0.00,-14.84,-14.98,36.37,25.59,32.13,70.20,70.20,93.00,568.63
+0.40,-14.84,-20.92,28.67,15.33,25.13,44.00,44.00,53.48,310.30
+0.80,-14.84,-13.83,17.09,17.47,23.47,31.56,31.56,84.65,328.17
+1.20,-14.84,-18.35,13.88,12.93,16.33,29.19,29.19,110.26,259.08
+1.60,-14.84,-17.58,9.65,8.58,17.26,13.71,17.26,78.85,198.17
+2.00,-14.84,-17.62,4.06,7.93,7.92,16.34,16.34,302.79,192.77

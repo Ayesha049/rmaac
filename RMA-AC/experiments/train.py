@@ -25,6 +25,9 @@ import torch.nn.functional as F
 
 from gym.spaces import Box, Discrete
 
+import collect_joint_data
+import joint_diffusion
+
 
 # ================= Diffusion globals =================
 DIFFUSION_MODEL = None
@@ -84,13 +87,19 @@ def parse_args():
      # parser.add_argument("--mode", choices=["train", "test"], default="train", help="Run mode: 'train' to train agents, 'test' to run evaluation")
     parser.add_argument(
     "--mode",
-    choices=["train", "test", "collect_diffusion", "train_diffusion"],
+    choices=["train", "test", "collect_diffusion", "train_diffusion",
+             "collect_joint_diffusion", "train_joint_denoiser", "test_joint",
+             "noise_sweep"],
     default="train",
     help="Run mode:\n"
-         "  'train'           : normal MADDPG training\n"
-         "  'test'            : robustness tests\n"
-         "  'collect_diffusion': roll out trained MADDPG and save trajectories\n"
-         "  'train_diffusion' : train diffusion model on saved trajectories"
+         "  'train'                   : normal MADDPG training\n"
+         "  'test'                    : robustness tests (legacy denoiser)\n"
+         "  'collect_diffusion'       : collect action-only trajectories\n"
+         "  'train_diffusion'         : train legacy action-only denoiser\n"
+         "  'collect_joint_diffusion' : collect joint (state+action+anchor) trajectories\n"
+         "  'train_joint_denoiser'    : train joint state-action denoiser\n"
+         "  'test_joint'              : evaluate with joint denoiser sweep\n"
+         "  'noise_sweep'             : joint obs+act noise sweep across noise_std values"
     )
     parser.add_argument("--adv-type", choices=["none", "obs", "act", "both"], default="obs", help="Adversary Type: 'none' clean training, 'obs' state uncertainity, 'act' action uncertainity, 'both' action+state uncertainity")
     parser.add_argument("--num-test-runs", type=int, default=3, help="Number of test runs to perform when in test mode")
@@ -114,6 +123,12 @@ def parse_args():
     parser.add_argument("--uniform-high", type=float, default=0.1, help="high bound for uniform noise")
     parser.add_argument("--llm-disturb-interval", type=int, default=5, help="steps between disturbances")
     parser.add_argument("--num-test-episodes", type=int, default=800, help="number of testing episodes")
+    parser.add_argument("--act-noise-list", type=float, nargs="+",
+                        default=[0.0, 0.4, 0.8, 1.2, 1.6, 2.0],
+                        help="action noise std values to sweep in noise_sweep mode")
+    parser.add_argument("--obs-noise-list", type=float, nargs="+",
+                        default=[0.0, 0.4, 0.8, 1.2],
+                        help="observation noise std values to sweep in noise_sweep mode")
 
         # --- LLM-guided adversary ---
     parser.add_argument("--llm-guide", type=str, default="adversary", choices=["none", "adversary"],
@@ -135,7 +150,29 @@ def parse_args():
     parser.add_argument("--diffusion-model-path", type=str, default="./diffusion_model.pt",
                         help="where to save the trained diffusion model")
 
-
+    # --- Joint denoiser settings ---
+    parser.add_argument("--num-collect-episodes", type=int, default=5000,
+                        help="episodes to collect for joint diffusion data")
+    parser.add_argument("--joint-diffusion-data-path", type=str,
+                        default="./joint_diffusion_data.npz",
+                        help="path to save/load joint (state+action+anchor) dataset")
+    parser.add_argument("--denoiser-type", type=str, default="joint",
+                        choices=["legacy", "joint"],
+                        help="'legacy' = action-only MLP, 'joint' = joint state-action denoiser")
+    parser.add_argument("--anchor-type", type=str, default="none",
+                        choices=["none", "init_obs", "landmarks", "roles", "landmarks+roles"],
+                        help="clean anchor signal type for the joint denoiser")
+    parser.add_argument("--denoiser-hidden-dim", type=int, default=256,
+                        help="hidden dimension for FiLM residual blocks")
+    parser.add_argument("--denoiser-n-blocks", type=int, default=4,
+                        help="number of FiLM residual blocks")
+    parser.add_argument("--channel-weight-lambda", type=float, default=0.1,
+                        help="state channel loss weight (action channel = 1.0)")
+    parser.add_argument("--joint-denoiser-model-path", type=str,
+                        default="./joint_denoiser.pt",
+                        help="path to save/load the joint denoiser checkpoint")
+    parser.add_argument("--corrupt-anchor-std", type=float, default=0.0,
+                        help="std of noise added to the anchor at test time (ablation)")
 
     return parser.parse_args()
 
@@ -1771,7 +1808,133 @@ if __name__ == '__main__':
     elif arglist.mode == "train_diffusion":
         train_diffusion(arglist)
 
+    elif arglist.mode == "collect_joint_diffusion":
+        tf.reset_default_graph()
+        with U.single_threaded_session():
+            env = make_env(arglist.scenario, arglist, arglist.benchmark)
+            obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
+            num_adversaries = min(env.n, arglist.num_adversaries)
+            trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+            U.initialize()
+            best_exp_name = arglist.exp_name + "best" if arglist.exp_name else None
+            U.load_state(arglist.save_dir, exp_name=best_exp_name)
+            print("[JointData] Loaded best checkpoint: {}".format(best_exp_name))
+            collect_joint_data.collect_joint_diffusion_data(env, trainers, arglist)
 
+    elif arglist.mode == "train_joint_denoiser":
+        joint_diffusion.train_joint_denoiser(arglist)
+
+    elif arglist.mode == "test_joint":
+        joint_diffusion.load_joint_denoiser(arglist)
+
+        if arglist.exp_name and not arglist.exp_name.endswith("best"):
+            arglist.exp_name = arglist.exp_name + "best"
+
+        arglist.noise_type = "gauss"
+
+        obs_noise_list = [0.0, 0.4, 0.8, 1.2]
+        act_noise_list = [0.0, 0.4, 0.8, 1.2, 1.6, 2.0]
+        k_start_list = [5, 10, 20, 40]
+
+        rew_clean = testWithoutP(arglist)
+        print("Clean baseline: {:.3f}".format(rew_clean))
+
+        results = []
+
+        for obs_std in obs_noise_list:
+            for act_std in act_noise_list:
+                arglist.act_noise = act_std
+                print("\n=== obs_noise={} act_noise={} ===".format(obs_std, act_std))
+
+                rew_noisy = joint_diffusion.testRobustnessAP_joint(
+                    arglist, use_denoiser=False, obs_noise_std=obs_std
+                )
+                print("  No denoiser: {:.3f}".format(rew_noisy))
+
+                diff_rewards = {}
+                for k_s in k_start_list:
+                    rew_d = joint_diffusion.testRobustnessAP_joint(
+                        arglist, use_denoiser=True, k_start=k_s, obs_noise_std=obs_std
+                    )
+                    diff_rewards[k_s] = rew_d
+                    print("  k_start={}: {:.3f}".format(k_s, rew_d))
+
+                best_rew = max(diff_rewards.values())
+                best_k = max(diff_rewards, key=diff_rewards.get)
+
+                denom = abs(rew_clean - rew_noisy)
+                recovery = (best_rew - rew_noisy) / denom if denom > 1e-6 else 1.0
+
+                row = {
+                    "obs_noise_std": obs_std,
+                    "act_noise_std": act_std,
+                    "reward_clean": r2(rew_clean),
+                    "reward_noisy": r2(rew_noisy),
+                    "best_reward_denoised": r2(best_rew),
+                    "best_k_start": best_k,
+                    "recovery_ratio": "{:.3f}".format(recovery),
+                }
+                for k_s in k_start_list:
+                    row["reward_k{}".format(k_s)] = r2(diff_rewards[k_s])
+                results.append(row)
+
+        anchor_tag = arglist.anchor_type
+        csv_path = "{}_joint_denoiser_{}_sweep.csv".format(
+            arglist.exp_name if arglist.exp_name else "exp", anchor_tag
+        )
+        df = pd.DataFrame(results)
+        df.to_csv(csv_path, index=False)
+        print("Saved joint denoiser sweep to {}".format(csv_path))
+
+    elif arglist.mode == "noise_sweep":
+        if arglist.exp_name and not arglist.exp_name.endswith("best"):
+            arglist.exp_name = arglist.exp_name + "best"
+
+        arglist.noise_type = "gauss"
+
+        rew_clean = testWithoutP(arglist)
+        print("Clean baseline: {:.3f}".format(rew_clean))
+
+        results = []
+        for act_std in arglist.act_noise_list:
+            for obs_std in arglist.obs_noise_list:
+                print("\n=== act_noise={} obs_noise={} ===".format(act_std, obs_std))
+
+                # action noise only
+                arglist.act_noise = act_std
+                rew_act = joint_diffusion.testRobustnessAP_joint(
+                    arglist, use_denoiser=False, obs_noise_std=0.0
+                )
+                print("  act_only:  {:.3f}".format(rew_act))
+
+                # observation noise only
+                arglist.act_noise = 0.0
+                rew_obs = joint_diffusion.testRobustnessAP_joint(
+                    arglist, use_denoiser=False, obs_noise_std=obs_std
+                )
+                print("  obs_only:  {:.3f}".format(rew_obs))
+
+                # joint noise
+                arglist.act_noise = act_std
+                rew_joint = joint_diffusion.testRobustnessAP_joint(
+                    arglist, use_denoiser=False, obs_noise_std=obs_std
+                )
+                print("  joint:     {:.3f}".format(rew_joint))
+
+                results.append({
+                    "act_noise_std":   act_std,
+                    "obs_noise_std":   obs_std,
+                    "act_only_reward": r2(rew_act),
+                    "obs_only_reward": r2(rew_obs),
+                    "joint_reward":    r2(rew_joint),
+                })
+
+        csv_path = "{}_noise_sweep.csv".format(
+            arglist.exp_name if arglist.exp_name else "exp"
+        )
+        df = pd.DataFrame(results)
+        df.to_csv(csv_path, index=False)
+        print("Saved noise sweep to {}".format(csv_path))
 
         # all_results = []
 

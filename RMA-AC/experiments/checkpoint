@@ -1,3 +1,3 @@
-model_checkpoint_path: "modelsimple_crypto__adv_act"
-all_model_checkpoint_paths: "modelsimple_crypto__adv_actbest"
-all_model_checkpoint_paths: "modelsimple_crypto__adv_act"
+model_checkpoint_path: "/home/axs0940/rmaac/RMA-AC/experiments/modelsimple_tag__clean"
+all_model_checkpoint_paths: "/home/axs0940/rmaac/RMA-AC/experiments/modelsimple_tag__cleanbest"
+all_model_checkpoint_paths: "/home/axs0940/rmaac/RMA-AC/experiments/modelsimple_tag__clean"

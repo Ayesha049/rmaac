@@ -15,9 +15,14 @@ DIFFUSION_STEPS="${DIFFUSION_STEPS:-100}"
 DIFFUSION_EPOCHS="${DIFFUSION_EPOCHS:-500}"
 DIFFUSION_BATCH_SIZE="${DIFFUSION_BATCH_SIZE:-64}"
 DIFFUSION_LR="${DIFFUSION_LR:-1e-4}"
+RUN_TRAINING="${RUN_TRAINING:-1}"
+RUN_EVALUATION="${RUN_EVALUATION:-1}"
+NUM_TEST_EPISODES="${NUM_TEST_EPISODES:-200}"
+T_START_LIST=(${T_START_LIST:-20 40 60})
+ADVERSARIAL_ADV_TYPE="${ADVERSARIAL_ADV_TYPE:-act}"
 
 # Edit this list to control which scenarios are processed.
-SCENARIOS=(${SCENARIOS:-simple_tag simple_speaker_listener simple_adversary simple_spread simple_push simple_crypto})
+SCENARIOS=(${SCENARIOS:-simple_tag})
 
 timestamp() {
     date "+%Y-%m-%d %H:%M:%S"
@@ -74,6 +79,21 @@ get_scenario_config() {
 
 mkdir -p "$OUT_DIR"
 
+if [[ "$RUN_TRAINING" != "0" && "$RUN_TRAINING" != "1" ]]; then
+    echo "RUN_TRAINING must be 0 or 1" >&2
+    exit 1
+fi
+
+if [[ "$RUN_EVALUATION" != "0" && "$RUN_EVALUATION" != "1" ]]; then
+    echo "RUN_EVALUATION must be 0 or 1" >&2
+    exit 1
+fi
+
+if [[ "$RUN_TRAINING" == "0" && "$RUN_EVALUATION" == "0" ]]; then
+    echo "Nothing to run: set RUN_TRAINING=1 and/or RUN_EVALUATION=1" >&2
+    exit 1
+fi
+
 for scenario in "${SCENARIOS[@]}"; do
     IFS='|' read -r extra_args <<< "$(get_scenario_config "$scenario")"
 
@@ -90,41 +110,68 @@ for scenario in "${SCENARIOS[@]}"; do
     echo "Clean checkpoint: ${clean_exp}"
     echo "Adv checkpoint: ${adv_exp}"
 
-    run_cmd "${scenario}:collect-clean" \
-        env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
-        --scenario "$scenario" \
-        --mode collect_diffusion \
-        $extra_args \
-        --num-episodes "$COLLECT_EPISODES" \
-        --diffusion-horizon "$DIFFUSION_HORIZON" \
-        --diffusion-data-path "$clean_data" \
-        --save-dir "$MODEL_DIR" \
-        --exp-name "$clean_exp"
+    if [[ "$RUN_TRAINING" == "1" ]]; then
+        run_cmd "${scenario}:collect-clean" \
+            env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
+            --scenario "$scenario" \
+            --mode collect_diffusion \
+            $extra_args \
+            --num-episodes "$COLLECT_EPISODES" \
+            --diffusion-horizon "$DIFFUSION_HORIZON" \
+            --diffusion-data-path "$clean_data" \
+            --save-dir "$MODEL_DIR" \
+            --exp-name "$clean_exp"
 
-    run_cmd "${scenario}:collect-adv" \
-        env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
-        --scenario "$scenario" \
-        --mode collect_diffusion \
-        $extra_args \
-        --num-episodes "$COLLECT_EPISODES" \
-        --diffusion-horizon "$DIFFUSION_HORIZON" \
-        --diffusion-data-path "$adv_data" \
-        --save-dir "$MODEL_DIR" \
-        --exp-name "$adv_exp"
+        run_cmd "${scenario}:collect-adv" \
+            env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
+            --scenario "$scenario" \
+            --mode collect_diffusion \
+            $extra_args \
+            --num-episodes "$COLLECT_EPISODES" \
+            --diffusion-horizon "$DIFFUSION_HORIZON" \
+            --diffusion-data-path "$adv_data" \
+            --save-dir "$MODEL_DIR" \
+            --exp-name "$adv_exp"
 
-    merge_npz "$clean_data" "$adv_data" "$merged_data"
+        merge_npz "$clean_data" "$adv_data" "$merged_data"
 
-    run_cmd "${scenario}:train-diffusion" \
-        env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
-        --scenario "$scenario" \
-        --mode train_diffusion \
-        --diffusion-data-path "$merged_data" \
-        --diffusion-model-path "$model_path" \
-        --diffusion-horizon "$DIFFUSION_HORIZON" \
-        --diffusion-steps "$DIFFUSION_STEPS" \
-        --diffusion-epochs "$DIFFUSION_EPOCHS" \
-        --diffusion-batch-size "$DIFFUSION_BATCH_SIZE" \
-        --diffusion-lr "$DIFFUSION_LR"
+        run_cmd "${scenario}:train-diffusion" \
+            env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
+            --scenario "$scenario" \
+            --mode train_diffusion \
+            --diffusion-data-path "$merged_data" \
+            --diffusion-model-path "$model_path" \
+            --diffusion-horizon "$DIFFUSION_HORIZON" \
+            --diffusion-steps "$DIFFUSION_STEPS" \
+            --diffusion-epochs "$DIFFUSION_EPOCHS" \
+            --diffusion-batch-size "$DIFFUSION_BATCH_SIZE" \
+            --diffusion-lr "$DIFFUSION_LR"
+    fi
+
+    if [[ "$RUN_EVALUATION" == "1" ]]; then
+        if [[ ! -f "$model_path" ]]; then
+            echo "Diffusion model not found for ${scenario}: $model_path" >&2
+            echo "Run with RUN_TRAINING=1 first, or point OUT_DIR to existing models." >&2
+            exit 1
+        fi
+
+        run_cmd "${scenario}:evaluate" \
+            env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" PYTHONUNBUFFERED=1 python -u train.py \
+            --scenario "$scenario" \
+            --mode test \
+            --compare-baseline-adv \
+            --t-start-list "${T_START_LIST[@]}" \
+            --adv-type "$ADVERSARIAL_ADV_TYPE" \
+            $extra_args \
+            --num-test-episodes "$NUM_TEST_EPISODES" \
+            --save-dir "$MODEL_DIR" \
+            --baseline-load-dir "$MODEL_DIR" \
+            --baseline-exp-name "$clean_exp" \
+            --adv-load-dir "$MODEL_DIR" \
+            --adv-exp-name "$adv_exp" \
+            --diffusion-model-path "$model_path" \
+            --exp-name "${scenario}__compare_df"
+    fi
 
 done
 
