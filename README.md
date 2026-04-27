@@ -1,4 +1,4 @@
-This code is modified from MADDPG and M3DDPG.
+This code is modified from MADDPG, RMA-AC, and M3DDPG.
 
 # Robust Multi-Agent Reinforcement Learning with State Uncertainty
 
@@ -6,6 +6,14 @@ This is the code for implementing the Robust Multi-Agent Actor-Critic (RMAAC) al
 [Robust Multi-Agent Reinforcement Learning with State Uncertainty](https://openreview.net/forum?id=CqTkapZ6H9).
 It is configured to be run in conjunction with environments from the
 [Multi-Agent Particle Environments (MPE)](https://github.com/openai/multiagent-particle-envs).
+
+The current workspace uses a single unified launcher in [RMA-AC/experiments/train.py](RMA-AC/experiments/train.py) for all supported training modes:
+
+- `maddpg-none`: plain MADDPG
+- `maddpg-earnie`: MADDPG with EARNIE regularization
+- `maddpg-act_adv`: action-adversarial training
+- `maddpg-obs_adv`: state-adversarial training
+- `m3ddpg`: adversarial M3DDPG-style training
 
 
 ## Installation
@@ -38,11 +46,45 @@ by following the `README`.
 
 - Ensure that `multiagent-particle-envs` has been added to your `PYTHONPATH` (e.g. in `~/.bashrc` or `~/.bash_profile`).
 
-- To run the code, `cd` into the `experiments` directory and run `train.py`:
+## Unified Training and Evaluation
 
-``python train.py --scenario simple``
+Use the RMA-AC launcher as the single entry point for training and evaluation:
 
-- You can replace `simple` with any environment in the MPE you'd like to run.
+```bash
+cd RMA-AC/experiments
+python train.py --scenario simple --mode train --variant maddpg-none
+```
+
+Replace `maddpg-none` with any of the supported variants listed above. A few common examples:
+
+```bash
+# Standard MADDPG
+python train.py --scenario simple_tag --mode train --variant maddpg-none
+
+# MADDPG with EARNIE regularization
+python train.py --scenario simple_tag --mode train --variant maddpg-earnie --use-ernie
+
+# RMA-AC action adversary
+python train.py --scenario simple_tag --mode train --variant maddpg-act_adv
+
+# RMA-AC state adversary
+python train.py --scenario simple_tag --mode train --variant maddpg-obs_adv
+
+# M3DDPG-style adversarial training
+python train.py --scenario simple_tag --mode train --variant m3ddpg
+```
+
+For evaluation, use the same launcher with `--mode test`:
+
+```bash
+python train.py --scenario simple_tag --mode test --variant maddpg-none
+python train.py --scenario simple_tag --mode test --variant maddpg-earnie
+python train.py --scenario simple_tag --mode test --variant maddpg-act_adv
+python train.py --scenario simple_tag --mode test --variant maddpg-obs_adv
+python train.py --scenario simple_tag --mode test --variant m3ddpg
+```
+
+You can replace `simple` or `simple_tag` with any MPE scenario that exists in your environment.
 
 ## Command-line options
 

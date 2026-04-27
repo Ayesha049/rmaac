@@ -55,6 +55,9 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.95, help="discount factor")
     parser.add_argument("--batch-size", type=int, default=1024, help="number of episodes to optimize at the same time")
     parser.add_argument("--num-units", type=int, default=64, help="number of units in the mlp")
+    parser.add_argument("--variant", type=str, default="maddpg-none",
+                        choices=["maddpg-none", "maddpg-earnie", "maddpg-act_adv", "maddpg-obs_adv", "m3ddpg"],
+                        help="single entrypoint variant to run")
     # Checkpointing
     parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
     parser.add_argument("--save-dir", type=str, default="./model", help="directory in which training state and model should be saved")
@@ -137,6 +140,18 @@ def parse_args():
                         choices=["stochastic", "uniform", "constraint"],
                         help="LLM adversarial perturbation type")
 
+    # --- EARNIE regularization ---
+    parser.add_argument("--use-ernie", action="store_true", default=False,
+                        help="enable EARNIE-style adversarial regularization in the actor loss")
+    parser.add_argument("--lambda-ernie", type=float, default=0.05,
+                        help="weight for the EARNIE regularization term")
+    parser.add_argument("--perturb-epsilon", type=float, default=0.001,
+                        help="max adversarial observation perturbation for EARNIE")
+    parser.add_argument("--perturb-alpha", type=float, default=0.001,
+                        help="step size for EARNIE perturbation ascent")
+    parser.add_argument("--perturb-num-steps", type=int, default=3,
+                        help="number of EARNIE inner-loop ascent steps")
+
     # --- Diffusion settings ---
     parser.add_argument("--diffusion-horizon", type=int, default=25,
                         help="trajectory length H for diffusion model")
@@ -175,6 +190,41 @@ def parse_args():
                         help="std of noise added to the anchor at test time (ablation)")
 
     return parser.parse_args()
+
+
+def apply_variant_defaults(arglist):
+    if arglist.variant == "maddpg-none":
+        arglist.adv_type = "none"
+        arglist.use_ernie = False
+    elif arglist.variant == "maddpg-earnie":
+        arglist.adv_type = "none"
+        arglist.use_ernie = True
+    elif arglist.variant == "maddpg-act_adv":
+        arglist.adv_type = "act"
+        arglist.use_ernie = False
+    elif arglist.variant == "maddpg-obs_adv":
+        arglist.adv_type = "obs"
+        arglist.use_ernie = False
+    elif arglist.variant == "m3ddpg":
+        arglist.adv_type = "none"
+        arglist.use_ernie = False
+    else:
+        raise ValueError("Unsupported variant: {}".format(arglist.variant))
+
+    if arglist.variant in ("maddpg-none", "maddpg-earnie"):
+        arglist.good_policy = "maddpg"
+        arglist.adv_policy = "maddpg"
+        arglist.noise_policy = "maddpg"
+    elif arglist.variant in ("maddpg-act_adv", "maddpg-obs_adv"):
+        arglist.good_policy = "rmaac"
+        arglist.adv_policy = "rmaac"
+        arglist.noise_policy = "rmaac"
+    elif arglist.variant == "m3ddpg":
+        arglist.good_policy = "mmmaddpg"
+        arglist.adv_policy = "mmmaddpg"
+        arglist.noise_policy = "mmmaddpg"
+
+    return arglist
 
 
 API_KEY = ""
@@ -292,20 +342,28 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
     q_model = mlp_model
     trainer = MADDPGAgentTrainer
     for i in range(num_adversaries):
+        policy_name = arglist.bad_policy if arglist.variant == "m3ddpg" else None
         trainers.append(trainer(
             "r_agent_%d" % i, p_model, q_model, obs_shape_n, env.observation_space, env.action_space, i, arglist,
-            local_q_func=(arglist.adv_policy=='ddpg')))
+            local_q_func=(arglist.adv_policy=='ddpg'),
+            ADV=(arglist.variant == "m3ddpg"),
+            policy_name=policy_name,
+            variant=arglist.variant))
     for i in range(num_adversaries, env.n):
+        policy_name = arglist.good_policy if arglist.variant == "m3ddpg" else None
         trainers.append(trainer(
             "r_agent_%d" % i, p_model, q_model, obs_shape_n, env.observation_space, env.action_space, i, arglist,
-            local_q_func=(arglist.good_policy=='ddpg')))
+            local_q_func=(arglist.good_policy=='ddpg'),
+            ADV=(arglist.variant == "m3ddpg"),
+            policy_name=policy_name,
+            variant=arglist.variant))
     return trainers
 
 
 def get_adversaries(env, obs_shape_n, arglist):
     adversaries = []
 
-    if arglist.adv_type == "none":
+    if arglist.adv_type == "none" or arglist.variant == "m3ddpg":
         return adversaries
 
     def mlp_model_adv_arg(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=None, constraint_epsilon = arglist.constraint_epsilon):
@@ -1691,6 +1749,7 @@ def run_action_noise_comparison(arglist):
 
 if __name__ == '__main__':
     arglist = parse_args()
+    arglist = apply_variant_defaults(arglist)
     # train(arglist)
     if arglist.mode == "train":
         seed_list = [1]  # list of random seeds for multiple runs

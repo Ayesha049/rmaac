@@ -25,7 +25,14 @@ def make_update_exp(vals, target_vals):
     expression = tf.group(*expression)
     return U.function([], [], updates=[expression])
 
-def p_train(make_obs_ph_n, act_space_n, p_index, p_func, q_func, obs_shape_n, optimizer, grad_norm_clipping=None, local_q_func=False, num_units=64, scope="trainer", reuse=None):
+def _normalize_per_example(x, eps=1e-8):
+    sq = tf.reduce_sum(tf.square(x), axis=list(range(1, len(x.get_shape()))), keepdims=True)
+    return x / (tf.sqrt(sq) + eps)
+
+
+def p_train(make_obs_ph_n, act_space_n, p_index, p_func, q_func, obs_shape_n, optimizer, grad_norm_clipping=None, local_q_func=False, num_units=64, scope="trainer", reuse=None,
+            use_ernie=False, lambda_ernie=0.1, perturb_epsilon=0.01, perturb_alpha=0.002, perturb_num_steps=3,
+            adversarial=False, adv_eps=1e-3, adv_eps_s=1e-5, num_adversaries=0, variant="baseline"):
     with tf.variable_scope(scope, reuse=reuse):
         # create distribtuions
         act_pdtype_n = [make_pdtype(act_space) for act_space in act_space_n]
@@ -55,7 +62,54 @@ def p_train(make_obs_ph_n, act_space_n, p_index, p_func, q_func, obs_shape_n, op
         q = q_func(q_input, 1, scope="q_func", reuse=True, num_units=num_units)[:,0]
         pg_loss = -tf.reduce_mean(q)
 
-        loss = pg_loss + p_reg * 1e-3
+        if use_ernie:
+            noise = tf.random_normal(shape=tf.shape(p_input), stddev=1e-3)
+            perturbed_obs = p_input + noise
+            p_orig = p
+
+            for _ in range(perturb_num_steps):
+                p_pert = p_func(
+                    perturbed_obs,
+                    int(act_pdtype_n[p_index].param_shape()[0]),
+                    scope="p_func",
+                    num_units=num_units,
+                    reuse=True,
+                )
+                diff = p_orig - p_pert
+                distance = tf.reduce_mean(tf.sqrt(tf.reduce_sum(tf.square(diff), axis=1) + 1e-12))
+                grad = tf.gradients(distance, [perturbed_obs])[0]
+                grad = _normalize_per_example(grad)
+                perturbed_obs = perturbed_obs + perturb_alpha * grad
+                delta = tf.clip_by_value(perturbed_obs - p_input, -perturb_epsilon, perturb_epsilon)
+                perturbed_obs = p_input + delta
+
+            p_pert_final = p_func(
+                perturbed_obs,
+                int(act_pdtype_n[p_index].param_shape()[0]),
+                scope="p_func",
+                num_units=num_units,
+                reuse=True,
+            )
+            diff_final = p_orig - p_pert_final
+            adv_reg_loss = tf.reduce_mean(tf.sqrt(tf.reduce_sum(tf.square(diff_final), axis=1) + 1e-12))
+        else:
+            adv_reg_loss = 0.0
+
+        if adversarial or variant == "m3ddpg":
+            num_agents = len(act_input_n)
+            if p_index < num_adversaries:
+                adv_rate = [adv_eps_s * (i < num_adversaries) + adv_eps * (i >= num_adversaries) for i in range(num_agents)]
+            else:
+                adv_rate = [adv_eps_s * (i >= num_adversaries) + adv_eps * (i < num_adversaries) for i in range(num_agents)]
+            raw_perturb = tf.gradients(pg_loss, act_input_n)
+            perturb = [tf.stop_gradient(tf.nn.l2_normalize(elem, axis=1)) for elem in raw_perturb]
+            perturb = [perturb[i] * adv_rate[i] for i in range(num_agents)]
+            new_act_n = [perturb[i] + act_input_n[i] if i != p_index else act_input_n[i] for i in range(len(act_input_n))]
+            adv_q_input = tf.concat(obs_ph_n + new_act_n, 1)
+            adv_q = q_func(adv_q_input, 1, scope="q_func", reuse=True, num_units=num_units)[:,0]
+            pg_loss = -tf.reduce_mean(adv_q)
+
+        loss = pg_loss + p_reg * 1e-3 + (lambda_ernie * adv_reg_loss if use_ernie else 0.0)
 
         optimize_expr = U.minimize_and_clip(optimizer, loss, p_func_vars, grad_norm_clipping)
 
@@ -74,7 +128,8 @@ def p_train(make_obs_ph_n, act_space_n, p_index, p_func, q_func, obs_shape_n, op
 
         return act, train, update_target_p, {'p_values': p_values, 'target_act': target_act}
 
-def q_train(make_obs_ph_n, act_space_n, q_index, q_func, optimizer, grad_norm_clipping=None, local_q_func=False, scope="trainer", reuse=None, num_units=64):
+def q_train(make_obs_ph_n, act_space_n, q_index, q_func, optimizer, grad_norm_clipping=None, local_q_func=False, scope="trainer", reuse=None, num_units=64,
+            adversarial=False, adv_eps=1e-3, adv_eps_s=1e-5, num_adversaries=0, variant="baseline"):
     with tf.variable_scope(scope, reuse=reuse):
         # create distribtuions
         act_pdtype_n = [make_pdtype(act_space) for act_space in act_space_n]
@@ -104,6 +159,21 @@ def q_train(make_obs_ph_n, act_space_n, q_index, q_func, optimizer, grad_norm_cl
 
         # target network
         target_q = q_func(q_input, 1, scope="target_q_func", num_units=num_units)[:,0]
+
+        if adversarial or variant == "m3ddpg":
+            num_agents = len(act_ph_n)
+            if q_index < num_adversaries:
+                adv_rate = [adv_eps_s * (i < num_adversaries) + adv_eps * (i >= num_adversaries) for i in range(num_agents)]
+            else:
+                adv_rate = [adv_eps_s * (i >= num_adversaries) + adv_eps * (i < num_adversaries) for i in range(num_agents)]
+            pg_loss = -tf.reduce_mean(target_q)
+            raw_perturb = tf.gradients(pg_loss, act_ph_n)
+            perturb = [adv_eps * tf.stop_gradient(tf.nn.l2_normalize(elem, axis=1)) for elem in raw_perturb]
+            perturb = [perturb[i] * adv_rate[i] for i in range(num_agents)]
+            new_act_n = [perturb[i] + act_ph_n[i] if i != q_index else act_ph_n[i] for i in range(len(act_ph_n))]
+            adv_q_input = tf.concat(obs_ph_n + new_act_n, 1)
+            target_q = q_func(adv_q_input, 1, scope='target_q_func', reuse=True, num_units=num_units)[:,0]
+
         target_q_func_vars = U.scope_vars(U.absolute_scope_name("target_q_func"))
         update_target_q = make_update_exp(q_func_vars, target_q_func_vars)
 
@@ -112,8 +182,11 @@ def q_train(make_obs_ph_n, act_space_n, q_index, q_func, optimizer, grad_norm_cl
         return train, update_target_q, {'q_values': q_values, 'target_q_values': target_q_values}
 
 class MADDPGAgentTrainer(AgentTrainer):
-    def __init__(self, name, p_model, q_model, obs_shape_n, obs_space_n, act_space_n, agent_index, args, local_q_func=False, ADV=False):
+    def __init__(self, name, p_model, q_model, obs_shape_n, obs_space_n, act_space_n, agent_index, args, local_q_func=False, ADV=False, policy_name=None, variant="baseline"):
         self.name = name
+        self.policy_name = policy_name or self.name
+        self.variant = variant
+        self.scope = self.name if policy_name is None else self.name + "_" + self.policy_name
         self.n = len(obs_shape_n)
         self.agent_index = agent_index
         self.args = args
@@ -121,11 +194,10 @@ class MADDPGAgentTrainer(AgentTrainer):
         for i in range(self.n):
             obs_ph_n.append(U.BatchInput(obs_shape_n[i], name="observation"+str(i)).get())
 
-        # TO-DO
         if ADV:
             # Create all the functions necessary to train the model
             self.q_train, self.q_update, self.q_debug = q_train(
-                scope=self.name,
+                scope=self.scope,
                 make_obs_ph_n=obs_ph_n,
                 act_space_n=act_space_n,
                 q_index=agent_index,
@@ -133,10 +205,15 @@ class MADDPGAgentTrainer(AgentTrainer):
                 optimizer=tf.train.AdamOptimizer(learning_rate=args.lr_adv),
                 grad_norm_clipping=0.5,
                 local_q_func=local_q_func,
-                num_units=args.num_units
+                num_units=args.num_units,
+                adversarial=True,
+                adv_eps=args.adv_eps,
+                adv_eps_s=args.adv_eps_s,
+                num_adversaries=args.num_adversaries,
+                variant=variant,
             )
             self.act, self.p_train, self.p_update, self.p_debug = p_train(
-                scope=self.name,
+                scope=self.scope,
                 make_obs_ph_n=obs_ph_n,
                 act_space_n=act_space_n,
                 p_index=agent_index,
@@ -146,12 +223,17 @@ class MADDPGAgentTrainer(AgentTrainer):
                 grad_norm_clipping=0.5,
                 local_q_func=local_q_func,
                 num_units=args.num_units,
-                obs_shape_n=obs_shape_n
+                obs_shape_n=obs_shape_n,
+                adversarial=True,
+                adv_eps=args.adv_eps,
+                adv_eps_s=args.adv_eps_s,
+                num_adversaries=args.num_adversaries,
+                variant=variant,
             )
         else:
             # Create all the functions necessary to train the model
             self.q_train, self.q_update, self.q_debug = q_train(
-                scope=self.name,
+                scope=self.scope,
                 make_obs_ph_n=obs_ph_n,
                 act_space_n=act_space_n,
                 q_index=agent_index,
@@ -159,10 +241,15 @@ class MADDPGAgentTrainer(AgentTrainer):
                 optimizer=tf.train.AdamOptimizer(learning_rate=args.lr),
                 grad_norm_clipping=0.5,
                 local_q_func=local_q_func,
-                num_units=args.num_units
+                num_units=args.num_units,
+                adversarial=(variant == "m3ddpg"),
+                adv_eps=args.adv_eps,
+                adv_eps_s=args.adv_eps_s,
+                num_adversaries=args.num_adversaries,
+                variant=variant,
             )
             self.act, self.p_train, self.p_update, self.p_debug = p_train(
-                scope=self.name,
+                scope=self.scope,
                 make_obs_ph_n=obs_ph_n,
                 act_space_n=act_space_n,
                 p_index=agent_index,
@@ -172,7 +259,17 @@ class MADDPGAgentTrainer(AgentTrainer):
                 grad_norm_clipping=0.5,
                 local_q_func=local_q_func,
                 num_units=args.num_units,
-                obs_shape_n=obs_shape_n
+                obs_shape_n=obs_shape_n,
+                use_ernie=getattr(args, "use_ernie", False),
+                lambda_ernie=getattr(args, "lambda_ernie", 0.05),
+                perturb_epsilon=getattr(args, "perturb_epsilon", 0.001),
+                perturb_alpha=getattr(args, "perturb_alpha", 0.001),
+                perturb_num_steps=getattr(args, "perturb_num_steps", 3),
+                adversarial=(variant == "m3ddpg"),
+                adv_eps=args.adv_eps,
+                adv_eps_s=args.adv_eps_s,
+                num_adversaries=args.num_adversaries,
+                variant=variant,
             )
         # Create experience buffer
         self.replay_buffer = ReplayBuffer(1e6)
