@@ -27,6 +27,7 @@ from gym.spaces import Box, Discrete
 
 import collect_joint_data
 import joint_diffusion
+import score_diffusion
 
 
 # ================= Diffusion globals =================
@@ -92,7 +93,7 @@ def parse_args():
     "--mode",
     choices=["train", "test", "collect_diffusion", "train_diffusion",
              "collect_joint_diffusion", "train_joint_denoiser", "test_joint",
-             "noise_sweep"],
+             "noise_sweep", "train_score", "test_score"],
     default="train",
     help="Run mode:\n"
          "  'train'                   : normal MADDPG training\n"
@@ -102,7 +103,9 @@ def parse_args():
          "  'collect_joint_diffusion' : collect joint (state+action+anchor) trajectories\n"
          "  'train_joint_denoiser'    : train joint state-action denoiser\n"
          "  'test_joint'              : evaluate with joint denoiser sweep\n"
-         "  'noise_sweep'             : joint obs+act noise sweep across noise_std values"
+         "  'noise_sweep'             : joint obs+act noise sweep across noise_std values\n"
+         "  'train_score'             : train score network (DSM, continuous sigma)\n"
+         "  'test_score'              : evaluate score-based Langevin correction"
     )
     parser.add_argument("--adv-type", choices=["none", "obs", "act", "both"], default="obs", help="Adversary Type: 'none' clean training, 'obs' state uncertainity, 'act' action uncertainity, 'both' action+state uncertainity")
     parser.add_argument("--num-test-runs", type=int, default=3, help="Number of test runs to perform when in test mode")
@@ -139,6 +142,12 @@ def parse_args():
     parser.add_argument("--llm-guide-type", type=str, default="stochastic",
                         choices=["stochastic", "uniform", "constraint"],
                         help="LLM adversarial perturbation type")
+
+    # --- M3DDPG adversarial perturbation ---
+    parser.add_argument("--adv-eps", type=float, default=1e-3,
+                        help="M3DDPG adversarial perturbation magnitude for good agents")
+    parser.add_argument("--adv-eps-s", type=float, default=1e-5,
+                        help="M3DDPG adversarial perturbation magnitude for adversary agents")
 
     # --- EARNIE regularization ---
     parser.add_argument("--use-ernie", action="store_true", default=False,
@@ -188,6 +197,22 @@ def parse_args():
                         help="path to save/load the joint denoiser checkpoint")
     parser.add_argument("--corrupt-anchor-std", type=float, default=0.0,
                         help="std of noise added to the anchor at test time (ablation)")
+
+    # --- Score network (DSM) settings ---
+    parser.add_argument("--score-model-path", type=str, default="./score_model.pt",
+                        help="path to save/load the score network checkpoint")
+    parser.add_argument("--score-sigma-min", type=float, default=0.01,
+                        help="minimum sigma for LogUniform training distribution")
+    parser.add_argument("--score-sigma-max", type=float, default=3.0,
+                        help="maximum sigma for LogUniform training distribution")
+    parser.add_argument("--score-eta", type=float, default=0.1,
+                        help="Langevin step size eta for score correction")
+    parser.add_argument("--score-sigma-est", type=float, default=0.5,
+                        help="estimated noise level sigma_est used at inference")
+    parser.add_argument("--score-n-steps", type=int, default=1,
+                        help="number of Langevin correction steps (1=single-step Phase 1)")
+    parser.add_argument("--lam-q", type=float, default=0.0,
+                        help="critic gradient weight lambda_Q (0=score-only Phase 1)")
 
     return parser.parse_args()
 
@@ -1954,26 +1979,30 @@ if __name__ == '__main__':
         rew_clean = testWithoutP(arglist)
         print("Clean baseline: {:.3f}".format(rew_clean))
 
+        # Evaluate each one-dimensional slice once, then fill the joint grid.
+        act_only_rewards = {}
+        for act_std in arglist.act_noise_list:
+            arglist.act_noise = act_std
+            rew_act = joint_diffusion.testRobustnessAP_joint(
+                arglist, use_denoiser=False, obs_noise_std=0.0
+            )
+            act_only_rewards[act_std] = rew_act
+            print("act_only  (act_noise={}): {:.3f}".format(act_std, rew_act))
+
+        obs_only_rewards = {}
+        arglist.act_noise = 0.0
+        for obs_std in arglist.obs_noise_list:
+            rew_obs = joint_diffusion.testRobustnessAP_joint(
+                arglist, use_denoiser=False, obs_noise_std=obs_std
+            )
+            obs_only_rewards[obs_std] = rew_obs
+            print("obs_only  (obs_noise={}): {:.3f}".format(obs_std, rew_obs))
+
         results = []
         for act_std in arglist.act_noise_list:
             for obs_std in arglist.obs_noise_list:
                 print("\n=== act_noise={} obs_noise={} ===".format(act_std, obs_std))
 
-                # action noise only
-                arglist.act_noise = act_std
-                rew_act = joint_diffusion.testRobustnessAP_joint(
-                    arglist, use_denoiser=False, obs_noise_std=0.0
-                )
-                print("  act_only:  {:.3f}".format(rew_act))
-
-                # observation noise only
-                arglist.act_noise = 0.0
-                rew_obs = joint_diffusion.testRobustnessAP_joint(
-                    arglist, use_denoiser=False, obs_noise_std=obs_std
-                )
-                print("  obs_only:  {:.3f}".format(rew_obs))
-
-                # joint noise
                 arglist.act_noise = act_std
                 rew_joint = joint_diffusion.testRobustnessAP_joint(
                     arglist, use_denoiser=False, obs_noise_std=obs_std
@@ -1983,8 +2012,8 @@ if __name__ == '__main__':
                 results.append({
                     "act_noise_std":   act_std,
                     "obs_noise_std":   obs_std,
-                    "act_only_reward": r2(rew_act),
-                    "obs_only_reward": r2(rew_obs),
+                    "act_only_reward": r2(act_only_rewards[act_std]),
+                    "obs_only_reward": r2(obs_only_rewards[obs_std]),
                     "joint_reward":    r2(rew_joint),
                 })
 
@@ -1994,6 +2023,62 @@ if __name__ == '__main__':
         df = pd.DataFrame(results)
         df.to_csv(csv_path, index=False)
         print("Saved noise sweep to {}".format(csv_path))
+
+    elif arglist.mode == "train_score":
+        # Train the score network with Denoising Score Matching.
+        # Requires joint trajectory data at --joint-diffusion-data-path.
+        score_diffusion.train_score_network(arglist)
+
+    elif arglist.mode == "test_score":
+        # Evaluate score-based Langevin correction across the act x obs noise grid.
+        # Loads score network from --score-model-path and policy from --load-dir.
+        score_diffusion.load_score_network(arglist)
+
+        if arglist.exp_name and not arglist.exp_name.endswith("best"):
+            arglist.exp_name = arglist.exp_name + "best"
+        arglist.noise_type = "gauss"
+
+        n_steps_list = [1, 3]
+        results = []
+
+        for act_std in arglist.act_noise_list:
+            arglist.act_noise = act_std
+            for obs_std in arglist.obs_noise_list:
+                print("\n=== act_noise={} obs_noise={} ===".format(act_std, obs_std))
+
+                # No-correction baseline
+                rew_noisy = joint_diffusion.testRobustnessAP_joint(
+                    arglist, use_denoiser=False, obs_noise_std=obs_std
+                )
+                print("  noisy (no correction): {:.3f}".format(rew_noisy))
+
+                row = {
+                    "act_noise_std": act_std,
+                    "obs_noise_std": obs_std,
+                    "reward_noisy": r2(rew_noisy),
+                }
+
+                for n_s in n_steps_list:
+                    rew_score = score_diffusion.testRobustnessScore(
+                        arglist,
+                        sigma_est=arglist.score_sigma_est,
+                        eta=arglist.score_eta,
+                        n_steps=n_s,
+                        lam_q=arglist.lam_q,
+                        obs_noise_std=obs_std,
+                    )
+                    col = "reward_score_n{}".format(n_s)
+                    row[col] = r2(rew_score)
+                    print("  score n_steps={}: {:.3f}".format(n_s, rew_score))
+
+                results.append(row)
+
+        anchor_tag = getattr(arglist, "anchor_type", "none")
+        csv_path = "{}_score_sweep_{}.csv".format(
+            arglist.exp_name if arglist.exp_name else "exp", anchor_tag
+        )
+        pd.DataFrame(results).to_csv(csv_path, index=False)
+        print("Saved score sweep to {}".format(csv_path))
 
         # all_results = []
 
